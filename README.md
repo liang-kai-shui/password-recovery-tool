@@ -5,7 +5,9 @@
 > 版本：`2.0` · 作者：凉开水
 
 ---
-
+## 如何使用
+前往 [releases](https://github.com/liang-kai-shui/password-recovery-tool/releases/tag/v2.0.0) 下载default.exe后直接运行即可
+---
 ## ✨ 功能特性
 
 - 🖥️ **美观的 GUI 主页**：深色主题、卡片式布局，所有功能集成在主页面，双击即可使用
