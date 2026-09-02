@@ -55,8 +55,8 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/<your-username>/<your-repo>.git
-cd <your-repo>
+git clone https://github.com/liang-kai-shui/password-recovery-tool.git
+cd password-recovery-tool
 
 # 运行（无需安装任何第三方依赖）
 python V8_Final.py
@@ -124,8 +124,10 @@ admin123
 ```
 .
 ├── V8_Final.py      # 主程序（单文件，含全部逻辑）
-├── app_data.json    # 运行数据（配置 + 历史 + 断点，首次运行自动生成）
-└── README.md
+├── app_data.json    # 运行数据（配置 + 历史 + 断点，首次运行自动生成，已被 gitignore）
+├── README.md        # 项目说明
+├── .gitignore       # 忽略运行时数据与打包产物
+└── LICENSE          # MIT 协议
 ```
 
 ---

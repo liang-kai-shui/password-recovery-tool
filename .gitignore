@@ -1,0 +1,14 @@
+# 运行时数据（含历史/密码/断点）
+app_data.json
+builtin_dict.txt
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# 打包产物
+build/
+dist/
+*.spec
