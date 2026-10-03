@@ -2,19 +2,24 @@
 
 一个基于 **Python + Tkinter** 的图形界面密码恢复工具，用于通过字典攻击方式恢复加密压缩包的密码。支持 **ZIP / 7z / RAR / LZ4** 等多种格式，内置多字典管理、断点续破、历史记录等实用功能。
 
-> 版本：`2.0` · 作者：凉开水
+> 版本：`2.1.0` · 作者：凉开水
 
 ---
+
 ## 如何使用
-前往 [releases](https://github.com/liang-kai-shui/password-recovery-tool/releases/tag/v2.0.0) 下载default.exe后直接运行即可
+
+前往 [v2.1.0 Release](https://github.com/liang-kai-shui/password-recovery-tool/releases/tag/v2.1.0) 下载 `PasswordRecoveryTool.exe`，双击运行即可。
+
 ---
+
 ## ✨ 功能特性
 
 - 🖥️ **美观的 GUI 主页**：深色主题、卡片式布局，所有功能集成在主页面，双击即可使用
 - 📦 **多格式支持**：ZIP（传统加密 / AES）、7z、RAR、LZ4，以及 tar / xz / bz2 / gz / zst / arj / cab / iso 等格式
 - 🚀 **高性能爆破**：
   - ZIP 传统加密 → 多线程即时爆破，速度极快
-  - 7z / RAR / LZ4 等 → 多进程调用 `7z.exe` 并行破解
+  - RAR5（带密码校验值）→ 进程内校验候选密码，命中后由 7-Zip 复核
+  - 7z / 其他 RAR / LZ4 等 → 多进程调用 `7z.exe` 并行破解
 - 📚 **多字典管理**：
   - 内置默认字典（Base64 + deflate 压缩嵌入程序）
   - 可添加多个外部字典，自由勾选任意组合参与破解
@@ -34,7 +39,8 @@
 |------|------|------|
 | ZIP（传统加密） | 内置 `zipfile` 多线程 | 无需额外依赖，速度最快 |
 | ZIP（AES 加密） | `7z.exe` 多进程 | 需要 7-Zip |
-| 7z / RAR / LZ4 | `7z.exe` 多进程 | 需要 7-Zip |
+| RAR5（带密码校验值） | 进程内 PBKDF2 校验 + `7z.exe` 复核 | 无须为每个候选启动 7-Zip |
+| 7z / 其他 RAR / LZ4 | `7z.exe` 多进程 | 源码运行需提供 7-Zip；单文件 EXE 已内置 |
 | tar / xz / bz2 / gz / zst / arj / cab / iso | `7z.exe` 多进程 | 需要 7-Zip |
 
 ---
@@ -43,10 +49,10 @@
 
 - **Python 3.7+**（推荐 3.9+）
 - 内置 Tkinter（标准库自带，无需额外安装）
-- **7-Zip**（可选，但强烈建议）：
-  - 仅在使用 7z / RAR / LZ4 / AES-ZIP 等格式时必需
+- **7-Zip**（源码运行处理 7z / RAR / LZ4 / AES-ZIP 时需要）：
+  - 程序会查找 PATH 和常见安装目录；便携版可在界面中点「选择 7z.exe」并保存路径
+  - 单文件 EXE 已包含 `7z.exe` 和 `7z.dll`，运行时会自动展开，无须另装
   - 下载地址：[https://www.7-zip.org/](https://www.7-zip.org/)
-  - 安装后程序会自动在 PATH 或常见安装目录中查找 `7z.exe`
 - **Pillow**（可选）：仅用于生成窗口图标，缺失时会自动回退到 Tk 原生绘制
 
 ---
@@ -61,19 +67,19 @@ git clone https://github.com/liang-kai-shui/password-recovery-tool.git
 cd password-recovery-tool
 
 # 运行（无需安装任何第三方依赖）
-python V8_Final.py
+python password-recovery-tool.py
 ```
 
 ### 打包为可执行文件（可选）
 
-如需分发独立的 `.exe`，可使用 PyInstaller：
+如需生成可直接双击的单文件 `.exe`，在 Windows 上安装 PyInstaller 后运行：
 
 ```bash
-pip install pyinstaller
-pyinstaller --onefile --windowed --name 密码字典恢复工具 V8_Final.py
+python -m pip install pyinstaller
+.\build.ps1 -SevenZipDir "C:\Program Files\7-Zip"
 ```
 
-打包后生成的 `app_data.json`、`builtin_dict.txt` 等数据文件会保存在 exe 同级目录。
+便携版 7-Zip 可把 `-SevenZipDir` 指向包含 `7z.exe`、`7z.dll`、`License.txt` 的目录。成品在 `dist\PasswordRecoveryTool.exe`，使用项目中的 `ico.ico` 作为图标。打包时一并包含 7-Zip 许可证；运行数据保存在 exe 同级目录。单文件版默认使用打包时内置的 7-Zip；若要改用系统安装版，可在“破解选项”中选择对应的 `7z.exe`。
 
 ---
 
@@ -125,7 +131,9 @@ admin123
 
 ```
 .
-├── V8_Final.py      # 主程序（单文件，含全部逻辑）
+├── password-recovery-tool.py  # GUI 与通用破解流程
+├── rar5_fast.py                # RAR5 密码校验值解析与进程内验证
+├── build.ps1                   # 内置 7-Zip 的单文件 EXE 构建脚本
 ├── app_data.json    # 运行数据（配置 + 历史 + 断点，首次运行自动生成，已被 gitignore）
 ├── README.md        # 项目说明
 ├── .gitignore       # 忽略运行时数据与打包产物

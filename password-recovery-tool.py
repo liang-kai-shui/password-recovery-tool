@@ -33,9 +33,10 @@ from typing import List, Optional, Tuple
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from rar5_fast import load_rar5_check, check_rar5_password, Rar5Check
 
 # ============================ 版本 ========================================= #
-VERSION = "2.0"
+VERSION = "2.1.0"
 AUTHOR = "凉开水"
 
 # 历史记录结果的中文标签
@@ -365,15 +366,21 @@ def copy_to_clipboard(root, text: str) -> bool:
     return False
 
 # ============================ 7z 工具 ===================================== #
-def find_7z() -> Optional[str]:
+def find_7z(configured_path: Optional[str] = None) -> Optional[str]:
+    if configured_path and os.path.isfile(configured_path):
+        return configured_path
+    bundled = Path(getattr(sys, "_MEIPASS", APP_DIR)) / "7z.exe"
+    if bundled.is_file():
+        return str(bundled)
     from shutil import which
-    for name in ("7z", "7z.exe", "7za", "7za.exe", "7zr", "7zr.exe"):
+    for name in ("7z", "7z.exe", "7zz", "7zz.exe"):
         p = which(name)
         if p:
             return p
     cands = [
         r"C:\Program Files\7-Zip\7z.exe",
         r"C:\Program Files (x86)\7-Zip\7z.exe",
+        r"C:\Program Files\7-Zip\7zz.exe",
         str(Path(os.environ.get("ProgramFiles", "")) / "7-Zip" / "7z.exe"),
         str(Path(os.environ.get("ProgramFiles(x86)", "")) / "7-Zip" / "7z.exe"),
     ]
@@ -412,29 +419,33 @@ def is_aes_zip(path: str) -> bool:
 
 # ============================ 多进程 7z worker ============================ #
 def _7z_proc_entry(archive: str, dict_path: str, sevenzip: str,
-                   counter, found, found_pw, current, start_index: int,
-                   stop_event) -> None:
+                   counter, found, found_index, current,
+                   stop_event, rar5_check: Optional[Rar5Check] = None) -> None:
     words = load_passwords_from_file(dict_path)
     n = len(words)
     while not stop_event.is_set():
         with counter.get_lock():
-            if found.value or counter.value >= n:
+            if found_index.value >= 0 or counter.value >= n:
                 return
             idx = counter.value
             counter.value += 1
-        if idx < start_index:
-            continue
         pw = words[idx]
         try:
             current[:60] = pw[:60].ljust(60, b" ")
         except Exception:
             pass
-        if test_7z_password(sevenzip, archive, pw):
-            found.value = 1
-            try:
-                found_pw.value = pw[:255]
-            except Exception:
-                pass
+        if rar5_check is None:
+            valid = test_7z_password(sevenzip, archive, pw)
+        else:
+            valid = (check_rar5_password(rar5_check, pw)
+                     and test_7z_password(sevenzip, archive, pw))
+        if valid:
+            # 只公布索引。共享的固定长度字符数组会截断长密码，且先写
+            # found 再写密码时，主进程可能读到尚未写完的结果。
+            with found_index.get_lock():
+                if found_index.value < 0:
+                    found_index.value = idx
+                    found.value = 1
             return
 
 # ============================ ZIP 多线程 ================================== #
@@ -530,29 +541,34 @@ def crack_zip_thread(archive_path: str, passwords: List[bytes],
 
 # ============================ 7z 多进程 =================================== #
 def crack_7z_process(archive: str, dict_path: str, sevenzip: str,
-                     total: int, start_index: int, shared: dict, stop_flag) -> Tuple[str, Optional[bytes]]:
+                     passwords: List[bytes], start_index: int, shared: dict,
+                     stop_flag, rar5_check: Optional[Rar5Check] = None
+                     ) -> Tuple[str, Optional[bytes]]:
+    total = len(passwords)
     if total == 0:
         return ("empty", None)
     if start_index >= total:
         return ("fail", None)
-    if test_7z_password(sevenzip, archive, b"___z__nopass__"):
+    if rar5_check is None and test_7z_password(sevenzip, archive, b"___z__nopass__"):
         return ("noenc", None)
 
     counter = mp.Value("Q", start_index)
     found = mp.Value("b", 0)
-    found_pw = mp.Array("c", 256)
+    found_index = mp.Value("q", -1)
     current = mp.Array("c", 64)
     stop_event = mp.Event()          # 新增：子进程停止信号
     shared["counter"] = counter
     shared["found"] = found
-    shared["pw"] = found_pw
+    shared["found_index"] = found_index
     shared["current"] = current
 
-    num_procs = max(1, os.cpu_count() or 2)
+    # RAR5 的校验在进程内运行；在大量逻辑线程的机器上启动更多进程
+    # 反而增加开销。其他格式仍沿用 7-Zip 多进程路径。
+    num_procs = max(1, min(os.cpu_count() or 2, 16 if rar5_check else 32))
     procs = [
         mp.Process(target=_7z_proc_entry,
                    args=(archive, dict_path, sevenzip, counter, found,
-                         found_pw, current, start_index, stop_event),
+                         found_index, current, stop_event, rar5_check),
                    daemon=True)
         for _ in range(num_procs)
     ]
@@ -560,23 +576,25 @@ def crack_7z_process(archive: str, dict_path: str, sevenzip: str,
         p.start()
 
     while not stop_flag.is_set():
-        if found.value or counter.value >= total:
+        # counter 记录的是已分配的候选，最后一批可能仍在子进程中测试。
+        if found_index.value >= 0 or not any(p.is_alive() for p in procs):
             break
         time.sleep(0.05)
 
     stop_event.set()  # 通知所有子进程立即退出
 
-    if found.value:
+    if found_index.value >= 0:
+        index = found_index.value
         with counter.get_lock():
             counter.value = total + 1
         for p in procs:
             p.join(timeout=5)
             if p.is_alive():
                 p.terminate()
-        return ("found", bytes(found_pw.value))
+        return ("found", passwords[index])
 
     # 被手动停止
-    if stop_flag.is_set() and counter.value < total:
+    if stop_flag.is_set():
         for p in procs:
             p.join(timeout=2)
             if p.is_alive():
@@ -611,6 +629,7 @@ class App:
         self._eta = "--"
         self._work_words: List[bytes] = []
         self._temp_dict_file: Optional[str] = None
+        self._sevenzip_path = ""
         self._crack_start_time: float = 0.0
         self._eta_smoother = ETASmoother(window_seconds=3.0)
         self._dm_win = None
@@ -709,6 +728,17 @@ class App:
         self.entry_seed.pack(side=tk.LEFT, padx=S(4))
         tk.Label(opt_row, text="（留空则随机）", font=("Microsoft YaHei", 8),
                  bg="#2a2a3e", fg="#6c7086").pack(side=tk.LEFT, padx=S(2))
+
+        sevenzip_row = tk.Frame(self._card_opt, bg="#2a2a3e")
+        sevenzip_row.pack(fill=tk.X, padx=S(5), pady=(0, S(5)))
+        tk.Button(sevenzip_row, text="选择 7z.exe", command=self.select_7z,
+                  font=("Microsoft YaHei", 9), bg="#89b4fa", fg="#11111b",
+                  relief="flat", cursor="hand2").pack(side=tk.LEFT, padx=S(2))
+        self.entry_7z = tk.Entry(sevenzip_row, font=("Consolas", 9),
+                                 bg="#1e1e2e", fg="#cdd6f4",
+                                 insertbackground="#cdd6f4")
+        self.entry_7z.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=S(5))
+        self.entry_7z.insert(0, self.cfg.get("sevenzip_path", ""))
 
         # ---- 进度区 ----
         self._card_prog = self._make_card(main, "📊 进度")
@@ -1101,6 +1131,17 @@ class App:
             self.cfg["last_dir"] = os.path.dirname(path)
             save_config(self.cfg)
             self.lbl_status.config(text=f"已选择压缩包：{path}")
+
+    def select_7z(self):
+        path = filedialog.askopenfilename(
+            title="选择 7-Zip 命令行程序",
+            filetypes=[("7-Zip 程序", "7z.exe 7zz.exe"), ("可执行文件", "*.exe")],
+        )
+        if path and os.path.isfile(path):
+            self.entry_7z.delete(0, tk.END)
+            self.entry_7z.insert(0, path)
+            self.cfg["sevenzip_path"] = path
+            save_config(self.cfg)
     def _on_shuffle_toggle(self):
         """勾选乱序撞库且未填种子时，自动生成随机种子填入输入框。"""
         if self.var_shuffle.get():
@@ -1228,6 +1269,10 @@ class App:
     def start_crack(self):
         if self.running:
             return
+        self._sevenzip_path = self.entry_7z.get().strip().strip('"')
+        if self._sevenzip_path != self.cfg.get("sevenzip_path", ""):
+            self.cfg["sevenzip_path"] = self._sevenzip_path
+            save_config(self.cfg)
         self.archive = self.entry_archive.get().strip().strip('"')
         if not self.archive:
             messagebox.showwarning("提示", "请先选择或输入要破解的压缩包路径。")
@@ -1324,32 +1369,33 @@ class App:
     def _run_crack(self):
         ext = os.path.splitext(self.archive)[1].lower()
         start_index = self._resume_from
-        total = len(self._work_words)
         self._temp_dict_file = None
         try:
             if ext == ".zip":
                 if is_aes_zip(self.archive):
-                    sevenzip = find_7z()
+                    sevenzip = find_7z(self._sevenzip_path)
                     if not sevenzip:
                         self.master.after(0, self._finish, ("no7z", None))
                         return
                     dict_path = self._ensure_temp_dict()
                     result = crack_7z_process(self.archive, dict_path,
-                                              sevenzip, total,
+                                              sevenzip, self._work_words,
                                               start_index, self.shared, self.stop_flag)
                 else:
                     result = crack_zip_thread(self.archive, self._work_words,
                                               start_index, self.shared, self.stop_flag)
             elif ext in (".7z", ".rar", ".lz4", ".tar", ".xz", ".bz2",
                          ".gz", ".zst", ".arj", ".cab", ".iso"):
-                sevenzip = find_7z()
+                sevenzip = find_7z(self._sevenzip_path)
                 if not sevenzip:
                     self.master.after(0, self._finish, ("no7z", None))
                     return
                 dict_path = self._ensure_temp_dict()
+                rar5_check = load_rar5_check(self.archive) if ext == ".rar" else None
                 result = crack_7z_process(self.archive, dict_path,
-                                          sevenzip, total,
-                                          start_index, self.shared, self.stop_flag)
+                                          sevenzip, self._work_words,
+                                          start_index, self.shared, self.stop_flag,
+                                          rar5_check=rar5_check)
             else:
                 result = ("unsupported", None)
             self.master.after(0, self._finish, result)
@@ -1512,7 +1558,7 @@ class App:
             self._clear_breakpoint()
         elif status == "no7z":
             self.lbl_status.config(text="❌ 未找到 7z.exe。")
-            messagebox.showerror("缺少依赖", "处理该格式需要 7-Zip。\n请安装：https://www.7-zip.org/")
+            messagebox.showerror("缺少依赖", "未找到 7z.exe，请在破解选项中选择其路径。")
         elif status == "unsupported":
             self.lbl_status.config(text="❌ 不支持的文件类型。")
             messagebox.showerror("错误", "不支持该文件类型。")
@@ -1782,7 +1828,8 @@ class App:
             "· 字典配置会自动保存，下次直接使用\n\n"
             "【格式支持】\n"
             "· ZIP 传统加密：多线程，速度极快\n"
-            "· 7z/RAR/等：多进程，需要安装 7-Zip\n\n"
+            "· RAR5：进程内验证候选，命中后用 7-Zip 复核\n"
+            "· 7z/其他 RAR：使用 7-Zip；打包版已内置\n\n"
             "【历史功能】\n"
             "· 每次破解自动记录时间、压缩包、字典、结果、耗时、速度\n"
             "· 点击「历史记录」可查看所有记录及详情\n\n"
@@ -1794,8 +1841,50 @@ class App:
         messagebox.showinfo("使用帮助", help_text)
 
 # ============================ 启动 ======================================== #
+def _benchmark_cli(args):
+    """Headless benchmark for comparing the source and the one-file build."""
+    if len(args) not in (3, 4):
+        raise ValueError("用法：--benchmark 压缩包 候选数量 结果JSON [7z.exe路径]")
+    archive, count_text, output_path = args[:3]
+    count = int(count_text)
+    if not 1 <= count <= 100000:
+        raise ValueError("候选数量必须在 1 到 100000 之间")
+    sevenzip = find_7z(args[3] if len(args) == 4 else None)
+    if sevenzip is None:
+        raise FileNotFoundError("未找到 7z.exe")
+    prefix = "__pwd_rec_benchmark_" + os.urandom(8).hex() + "_"
+    words = [(prefix + str(index)).encode() for index in range(count)]
+    fd, dict_path = tempfile.mkstemp(prefix="pwd_rec_benchmark_", suffix=".txt",
+                                      dir=APP_DIR)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            for word in words:
+                stream.write(word + b"\n")
+        started = time.perf_counter()
+        status, _ = crack_7z_process(
+            archive, dict_path, sevenzip, words, 0, {}, threading.Event()
+        )
+        elapsed = time.perf_counter() - started
+        Path(output_path).write_text(json.dumps({
+            "status": status, "count": count,
+            "seconds": elapsed, "rate": count / elapsed,
+            "sevenzip": sevenzip,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+    finally:
+        os.unlink(dict_path)
+
+
 def main():
     mp.freeze_support()
+    if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
+        try:
+            _benchmark_cli(sys.argv[2:])
+        except Exception:
+            if len(sys.argv) >= 5:
+                import traceback
+                Path(sys.argv[4]).write_text(traceback.format_exc(), encoding="utf-8")
+            raise
+        return
     root = tk.Tk()
     setup_window_scaling(root)
     set_window_icon(root)
